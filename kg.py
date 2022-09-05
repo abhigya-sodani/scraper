@@ -11,14 +11,244 @@ import html2text
 import ssl
 from progress.bar import Bar
 from cs50 import SQL
+import tqdm
 import logging
+import asyncio
+from copy import deepcopy
+import aiohttp
 from selenium.webdriver.remote.remote_connection import LOGGER
 from difflib import SequenceMatcher
+import pickle
+import urllib.parse
+from selenium.common.exceptions import NoSuchElementException
+from selenium.common.exceptions import StaleElementReferenceException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions
+from simplified_scrapy.request import req
+from simplified_scrapy import Spider, SimplifiedDoc, SimplifiedMain
+import collections
+logging.disable(logging.DEBUG)
+class WebScraper(object):
+    def __init__(self,comps,keyword, tag):
+        self.comps = comps
+        # Global Place To Store The Data:
+        self.matches= []
+        self.keyword=keyword
+        self.tag=tag
+        self.index_dict={}
+        self.html_dict={}
 
-db = SQL("sqlite:///main.db")
-LOGGER.setLevel(logging.ERROR)
-urllibLogger.setLevel(logging.ERROR)
+    def run_scraper_to_find_matches(self):
+        asyncio.run(self.get_matches())
+        
+    def run_scraper_to_build_index(self):
+        asyncio.run(self.create_index())
 
+    def add_comps_to_scrape(self,companies):
+        for i in companies:
+            self.comps.append(i)
+
+    def filterLinksByKeywords(self,links,keywords):
+        pages=[]
+        for i in links:
+            if i["url"] is None:
+                continue
+            elif  i["url"].lower().__contains__(".jpg") or   i["url"].lower().__contains__(".png") or   i["url"].lower().__contains__(".svg") or   i["url"].lower().__contains__(".gif"):
+                continue
+            else:
+                for j in keywords:
+                    if  i["url"].lower().__contains__(j.lower()):
+                        pages=similarAppend( i["url"],pages)
+                        continue    
+        return pages
+
+    async def fetch_links(self, session, company_name, url):
+        try:
+            async with session.get("http://www."+url) as response:
+                # 1. Extracting the Text:
+                
+                text = await response.text()
+                # 2. Extracting the  Tag:
+                links=await self.extract_links(url,text) 
+                return company_name, links
+        except Exception as e:
+            #print(str(e))
+            pass
+    
+    def store_links_index(self):
+        with open('links_index.pkl', 'wb') as file:
+       
+            pickle.dump(self.index_dict, file, protocol=pickle.HIGHEST_PROTOCOL)
+    
+    def store_html_index(self):
+        with open('html_index.pkl', 'wb') as file:
+        
+            pickle.dump(self.html_dict, file, protocol=pickle.HIGHEST_PROTOCOL)
+
+    async def fetch(self, session, company_name, url):
+        try:
+            async with session.get(url) as response:
+                # 1. Extracting the Text:
+                text = await response.text()
+                return text, url, company_name
+        except Exception as e:
+            #print(str(e))
+            pass
+
+    async def extract_links(self, base, text):
+        doc = SimplifiedDoc(text)
+        return doc.listA(url=base)
+      
+    
+    async def extract_title_tag(self, text):
+        try:
+            soup = BeautifulSoup(text, 'html.parser')
+            return soup.title
+        except Exception as e:
+            print(str(e))
+
+    def load_index(self):
+        with open('links_index.pkl', 'rb') as f:
+            self.index_dict = pickle.load(f)
+        
+        with open('html_index.pkl', 'rb') as f:
+            self.html_dict = pickle.load(f)        
+
+    async def create_index(self):
+        self.store_html_index()
+        self.store_links_index()
+        self.load_index()
+        tasks = []
+        tasks1 = []
+        timeout_time=int(len(self.comps)*0.11823-6.86678)
+        headers = {
+            "user-agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"}
+        timeout = aiohttp.ClientTimeout(total=None,sock_connect=100,sock_read=100)
+        async with aiohttp.ClientSession(headers=headers,timeout=timeout) as session:
+            for comp in self.comps:
+                
+                tasks.append(self.fetch_links(session, comp[0], comp[1]))
+
+            links=[]
+            for f in tqdm.tqdm(asyncio.as_completed(tasks), total=len(tasks)):
+                links.append(await f)
+
+            del tasks[:]
+            del tasks
+            
+            for i in links:
+                if i is None:
+                    continue
+                if i[0] not in self.index_dict.keys():
+                    self.index_dict.update({i[0]:{}})
+                for j in i[1]:
+                    if j is None:
+                        continue
+                    self.index_dict[i[0]].update({j["url"]:j["title"]})
+                    #tasks1.append(self.fetch(session,i[0],j["url"]))
+            """
+            site_texts=[]
+            for f in tqdm.tqdm(asyncio.as_completed(tasks1), total=len(tasks1)):
+                site_texts.append(await f)
+            #site_texts = await asyncio.gather(*tasks1)
+            counter_text=0
+            for text in site_texts:
+                counter_text+=1
+                if text is not None:
+                    if text[0] is None:
+                        continue
+                    self.html_dict.update({text[1]:text[0]})
+                    continue
+                else:
+                    continue
+            """
+                    
+    async def get_matches(self):
+        tasks = []
+        tasks1 = []
+        links=[]
+        site_texts=[]
+        timeout_time=int(len(self.comps)*0.11823-6.86678)
+        headers = {
+            "user-agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"}
+        timeout = aiohttp.ClientTimeout(total=None,sock_connect=25,sock_read=25)
+        async with aiohttp.ClientSession(headers=headers,timeout=timeout) as session:
+            for comp in self.comps:
+                if comp[0] in self.index_dict.keys():
+                    
+                    stored_links=[]
+                    for i in self.index_dict[comp[0]].keys():
+                        stored_links.append({"url":i,"title":self.index_dict[comp[0]][i]})
+                    links.append((comp[0],stored_links))
+                else:
+                    tasks.append(self.fetch_links(session, comp[0], comp[1]))
+            
+            for f in tqdm.tqdm(asyncio.as_completed(tasks), total=len(tasks)):
+                
+                links.append(await f)
+                
+              
+            del tasks[:]
+            del tasks
+            #links = await asyncio.gather(*tasks)
+            counter=0
+            counter_none=0
+            counterNew=0
+            for i in links:
+                counter+=1
+                if i==None:
+                    counter_none+=1
+                    continue
+                print(i[0])
+                if i[0] not in self.index_dict.keys():
+                    self.index_dict.update({i[0]:{}})
+                    for j in i[1]:
+                        if j is None:
+                            continue
+                        self.index_dict[i[0]].update({j["url"]:j["title"]})
+                filtered_links=self.filterLinksByKeywords(i[1],self.keyword)
+                for j in filtered_links:
+                    if j not in self.html_dict.keys():
+                        tasks1.append(self.fetch(session,i[0],j))
+                    else:
+                        site_texts.append((self.html_dict[j][1],j,self.html_dict[j][0]))
+            print()
+            print(counterNew)
+            print("percent none: "+str(float(counter_none)/counter))
+            for f in tqdm.tqdm(asyncio.as_completed(tasks1), total=len(tasks1)):
+                site_texts.append(await f)
+           
+            counter_text=0
+            for text in site_texts:
+                counter_text+=1
+                if text is not None:
+                    h = html2text.HTML2Text()
+                    h.ignore_links = True
+                    if text[0] is None:
+                        continue
+                    self.html_dict.update({text[1]:(text[2],text[0])})
+                    try:
+                        doc=h.handle(str(text[0]))
+                    except:
+                        continue
+                    final=[]
+                    for i in doc.split():
+                        if i.isalpha():
+                            if len(i)>2:
+                                final.append(i.lower())
+                    for k in self.tag:
+                        if k in final:
+                            if text[2] not in self.matches:
+                                output.write(str(text[2])+"\n")
+                                self.matches.append(text[2])
+                            continue  
+                    continue
+                else:
+                    continue
+            #print("percent of links scraped:"+str(counter_text/float(len(tasks1))))
+
+        
 class Url(object):
     '''A url object that can be compared with other url orbjects
     without regard to the vagaries of encoding, escaping, and ordering
@@ -41,25 +271,30 @@ class Cache:
     def __init__(self):
         self.cache={}
 
-    def loadFromCache(self):
-        kw=db.execute("SELECT * FROM keywords")
-        for i in kw:
-            self.cache.update({i["company"]:i["keywords"].split("|")})
-    def inCache(self,company):
-        if company in self.cache.keys():
-            return True
-        return False
+    def getCompaniesInCSV(self):
+        comps = pandas.read_csv("companies_sorted.csv")
+        return comps.iloc
+    def updateCacheSection(self,map,key,value):
+        if key in map.keys():
+            pass
+        else:
+            map.update({key:value})
+
+    def createCache(self):
+        for i in self.getCompaniesInCSV():
+            self.updateCacheSection(self.cache,i["industry"],{})
+            self.updateCacheSection(self.cache[i["industry"]],i["country"],{})
+            self.updateCacheSection(self.cache[i["industry"]][i["country"]],i["size range"],{})
+            self.updateCacheSection(self.cache[i["industry"]][i["country"]][i["size range"]], i["name"],i["domain"])
+            print(i["name"])
     
-
-def putCompaniesInDB():
-     for i in companies.iloc:
-        print(i[1])
-        i=i.fillna(0)
-        db.execute("""INSERT INTO companies(Name,Domain,Year_Founded,Industry,Size,Locality,Country,Linkedin,
-        Current_Employees,Total_Employees) VALUES(:name, :domain, :year_founded, :industry, :size, :locality, 
-        :country, :linkedin, :current_employees, :total_employees)""", name=i[1], domain=i[2], year_founded=str(int(i[3])), 
-        industry=i[4], size=i[5], locality=i[6], country=i[7], linkedin=i[8], current_employees=str(i[9]), total_employees=str(i[10]))
-
+    def getCache(self):
+        return self.cache
+    
+    def loadCache(self):
+        f = open ("cache.pkl", "rb")
+        self.cache= pickle.load(f)
+           
 def similarAppend(a, li):
     for i in li:
         if SequenceMatcher(None, a, i).ratio()>=0.85:
@@ -69,203 +304,100 @@ def similarAppend(a, li):
     li.append(a)
     return li
 
-def getCompaniesInDB():
-    companies=db.execute("SELECT * FROM companies")
-    return companies
-
-def getKeywordsInDB():
-    kw=db.execute("SELECT * FROM keywords")
-    return kw
-def getLastKeywordEntry():
-    kw=getKeywordsInDB()
-    last_entry_name=kw[len(kw)-1]
-    return last_entry_name["company"]
-
-def putKeywordsInDB():
-    comp=getCompaniesInDB()
-    for i in comp:
-        db.execute("INSERT INTO keywords (company,keywords) VALUES (:name,:keywords)", name=i["Name"], keywords="|".join(getKeywords(i["Name"])))
-
-def appendKeywordsInDB(last):
-    comp=getCompaniesInDB()
-    last_keyword_seen=False
-    for i in comp:
-        if not last_keyword_seen:
-            if i["Name"]==last:
-                last_keyword_seen=True
-        else:
-            db.execute("INSERT INTO keywords (company,keywords) VALUES (:name,:keywords)", name=i["Name"], keywords="|".join(getKeywords(i["Name"])))
-
-def search(company):
-    comp=getCompaniesInDB()
-    for i in comp:
-        
-        if i["Name"].__contains__(company):
-            return i
-       
-
-def getAllLinks(driver):
-    links=[]
-    for i in driver.find_elements_by_tag_name("a"):
-        links.append(i.get_attribute("href"))
-    return links
-
-def filterLinksForPages(links,url):
-    pages=[]
-    for i in links:
-        if not i.__contains__(url):
-            continue
-        elif i.lower().__contains__(".jpg") or  i.lower().__contains__(".png") or  i.lower().__contains__(".svg") or  i.lower().__contains__(".gif"):
-            continue
-        else:
-            pages=similarAppend(i,pages)
-   
-    return pages[0:10]
-
-def code_of_site(url):
-    ssl._create_default_https_context = ssl._create_unverified_context
+def merge_dict(d1, d2):
     """
-    req = Request(
-    url, 
-    data=None, 
-    headers={
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.47 Safari/537.36'
-    }
-    )
+    Modifies d1 in-place to contain values from d2.  If any value
+    in d1 is a dictionary (or dict-like), *and* the corresponding
+    value in d2 is also a dictionary, then merge them in-place.
     """
-    browser = webdriver.PhantomJS()
-    browser.set_page_load_timeout(60)
-    try:
-        browser.get(url)
-    except:
-        return ""
-    #html_page = urlopen(req)
-    #soup = BeautifulSoup(html_page, "html.parser")
-    h = html2text.HTML2Text()
-    h.ignore_links = True
-    return h.handle(str(browser.page_source))
- 
+    for k,v2 in d2.items():
+        v1 = d1.get(k) # returns None if v1 has no value for this key
+        if ( isinstance(v1, collections.Mapping) and 
+             isinstance(v2, collections.Mapping) ):
+            merge_dict(v1, v2)
+        else:
+            d1[k] = v2
 
-def getKeywords(company):
-    try:
-        doc=code_of_site("http://www."+search(company)["Domain"])
-        final=[]
-        for i in doc.split():
-            if i.isalpha():
-                if len(i)>2:
-                    final.append(i.lower())
-    except:
-        return []
-    
-    return final
-
-def searchForKeyword(word):
-    keywords=db.execute("SELECT * FROM keywords")
-    comps=[]
-    for i in keywords:
-        if word.lower() in i["keywords"]:
-            comps.append(i["company"])
-    
-    return comps
-
-def filterByIndustry():
-    comps=getCompaniesInDB()
-    industries=[]
-    for i in comps:
-        if i["Industry"] not in industries:
-            industries.append(i["Industry"])
-    print("Select an industry you would like to select:")
-    for i in range(0,len(industries)):
-        print(str(i)+": "+industries[i])
-    inp=input()
-    selected=industries[int(inp)]
-    comps_final=[]
-    for i in comps:
-        if i["Industry"] == selected:
-            comps_final.append(i)
-    return comps_final
-
-def filterByLocality(comps):
-    countries=[]
-    for i in comps:
-        if(i["Locality"].split(",")[0]=='0'):
+def filterCache(map):
+    choices=[]
+    for i in map.keys():
+        choices.append(i)
+    print("Select (seperate with commas no spaces):")
+    for i in range(0,len(choices)):
+        print(str(i)+": "+str(choices[i]))
+    inp=input().split(",")
+    selected=choices[int(inp[0])]
+    for i in range(0,len(inp)):
+        if i==0:
             continue
-        if i["Locality"].split(",")[2] not in countries:
-            countries.append(i["Locality"].split(",")[2])
-    print("Select an country you would like to select:")
-    for i in range(0,len(countries)):
-        print(str(i)+": "+countries[i])
-    inp=input()
-    selected=countries[int(inp)]
-    comps_final=[]
-    for i in comps:
-        if(i["Locality"].split(",")[0]=='0'):
-            continue
-        if i["Locality"].split(",")[2].lower() == selected.lower():
-            comps_final.append(i)
-    return comps_final
+        merge_dict(map[selected],map[choices[int(inp[i])]])
 
-def filterByLocality(comps):
-    countries=[]
-    for i in comps:
-        if(i["Locality"].split(",")[0]=='0'):
-            continue
-        if i["Locality"].split(",")[2] not in countries:
-            countries.append(i["Locality"].split(",")[2])
-    print("Select an country you would like to select:")
-    for i in range(0,len(countries)):
-        print(str(i)+": "+countries[i])
-    inp=input()
-    selected=countries[int(inp)]
-    comps_final=[]
-    for i in comps:
-        if(i["Locality"].split(",")[0]=='0'):
-            continue
-        if i["Locality"].split(",")[2].lower() == selected.lower():
-            comps_final.append(i)
-    return comps_final
+    return map[selected]
 
-def filterBySize(comps,lower,upper):
-    comps_final=[]
-    for i in comps:
-        if int(i["Current_Employees"])<int(upper) and int(i["Current_Employees"])>int(lower):
-            comps_final.append(i)
-    return comps_final
-"""
 c=Cache()
-c.loadFromCache()
-while True:
-    print("What Industry Do You Want to Search")
-    comps=filterByIndustry()
-    print("What Country Would You like to Search By")
-    comps=filterByLocality(comps)
-    print("What size of company do you want (min):")
-    low=input()
-    print("What size of company do you want (max):")
-    hi=input()
-    comp=filterBySize(comps,low,hi)
-    print(len(comps))
-    print("What keyword would you like to find?:")
-    kw=input()
-    returnList=[]
-    for i in comps:
-        if c.inCache(i["Name"]):
-            if kw in c.cache[i["Name"]]:
-                returnList.append(i["Name"])
+c.loadCache()
+cache=c.getCache()
+f=cache
+while type(list(f.values())[0])==dict:
+    f=filterCache(f)
+
+url_tags=input("Enter filters for urls (seperated by commas with no spaces)").split(",")
+words=input("words to search for? (seperated by commas with no spaces)").split(",")
+words=[x.lower() for x in words]
+comps=[]
+index=input("Do you want to create and index(y/n)")
+w=WebScraper(deepcopy(comps),url_tags,words)
+w.load_index()
+print(len(f.items()))
+if index=="n":
+
+    for i in f.items():
+        if type(i[0])!=str or type(i[1])!=str:
+            continue
+        comps.append((i[0],i[1]))
+        if len(comps)>2000:
+            output=open("matches.txt","a")
+            w.add_comps_to_scrape(deepcopy(comps))
+            w.run_scraper_to_find_matches()
+            comps=[]
+            w.comps=deepcopy(comps)
+            output.close()
         else:
             continue
-            if kw in getKeywords(i["Name"]):
-                returnList.append(i["Name"])
-    print(returnList)
+        
+    output=open("matches.txt","a")
+    w.add_comps_to_scrape(deepcopy(comps))
+    w.run_scraper_to_find_matches()
+    output.close()
+    w.store_html_index()
+    w.store_links_index()
+    print("Index Made")
 
-"""
-#code_of_site("http://www.causal.app")
+elif index=='y':
 
-browser = webdriver.PhantomJS()
-browser.set_page_load_timeout(60)
+    for i in f.items():
+        if type(i[0])!=str or type(i[1])!=str:
+            continue
+        comps.append((i[0],i[1]))
+        if len(comps)>2000:
+            w.add_comps_to_scrape(deepcopy(comps))
+            w.run_scraper_to_build_index()
+            comps=[]
+            w.comps=deepcopy(comps)
+        else:
+            continue
+        
 
-browser.get("http://www.causal.app/")
-print(filterLinksForPages(getAllLinks(browser),"causal.app"))
+    w.add_comps_to_scrape(deepcopy(comps))
+    w.run_scraper_to_build_index()
+    
+ 
+   
+    
 
+    
+    
 
-
+    
+    
+    
